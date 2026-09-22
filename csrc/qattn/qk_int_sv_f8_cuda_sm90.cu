@@ -17,20 +17,27 @@
 #include "../pytorch_extensions_utils.cuh"
 #include "decl.cuh"
 
-void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
+torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
                     torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,
                     torch::Tensor output,
                     torch::Tensor lut,
                     torch::Tensor valid_block_num,
+                    std::optional<torch::Tensor> bitmask,  // addition ClusterAttention
                     torch::Tensor query_scale,
                     torch::Tensor key_scale,
                     torch::Tensor value_scale,
                     int tensor_layout,
-                    int is_causal,
+                    int is_causal,  // gets ignored if 'bitmask' is not None, maybe should work together
                     int qk_quant_gran,
-                    float sm_scale)
+                    float sm_scale,
+                    // start addition ClusterAttention
+                    int return_lse,
+                    std::optional<torch::Tensor> lse_init,
+                    float last_centroid_bias
+                    // end addition ClusterAttention
+)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -70,6 +77,17 @@ void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
   CHECK_DIMS(query_scale, 3);
   CHECK_DIMS(key_scale, 3);
   CHECK_DIMS(value_scale, 3);
+
+  // start addition ClusterAttention
+  if (lse_init.has_value())
+  {
+    CHECK_CUDA(lse_init.value());
+    CHECK_CONTIGUOUS(lse_init.value());
+    CHECK_DTYPE(lse_init.value(), at::ScalarType::Float);
+    CHECK_DIMS(lse_init.value(), 3);
+    TORCH_CHECK(return_lse, "lse_init requires return_lse");  // not great, could be fixed
+  }
+  // end addition ClusterAttention
 
   const int batch_size = query.size(0);
   const int head_dim = query.size(3);
@@ -134,6 +152,8 @@ void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
     throw std::invalid_argument(err_msg.str());  
   }
 
+  torch::Tensor lse = torch::empty({0});  // addition ClusterAttention (placeholder if not returning lse)
+
   auto output_dtype = output.scalar_type();
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -145,6 +165,15 @@ void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
           constexpr int NUM_THREADS = 128;
 
           assert(padded_kv_len >= div_ceil(kv_len, CTA_K) * CTA_K);
+
+          if (lse_init.has_value()) {
+            lse = lse_init.value();
+            CHECK_SHAPE(lse, batch_size, num_qo_heads, qo_len);
+          } else if (return_lse) {
+            lse = torch::full({batch_size, num_qo_heads, qo_len},
+                -5000000.0f,
+                query.options().dtype(at::ScalarType::Float));
+          }  // addition ClusterAttention
 
           if constexpr (QK_QUANT_GRAN == 1)
           {
@@ -174,8 +203,10 @@ void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
               reinterpret_cast<__nv_fp8_e4m3*>(value.data_ptr()),
               reinterpret_cast<DTypeOut*>(output.data_ptr()),
               nullptr,
+              return_lse ? lse.data_ptr<float>() : nullptr,  // addition ClusterAttention
               reinterpret_cast<int32_t*>(lut.data_ptr()),
               reinterpret_cast<int32_t*>(valid_block_num.data_ptr()),
+              bitmask.has_value() ? reinterpret_cast<uint32_t*>(bitmask.value().data_ptr()) : nullptr,  // addition ClusterAttention
               nullptr,
               reinterpret_cast<float*>(query_scale.data_ptr()),
               reinterpret_cast<float*>(key_scale.data_ptr()),
@@ -185,14 +216,18 @@ void qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
               stride_bz_k, stride_seq_k, stride_h_k,
               stride_bz_v, stride_h_v, stride_d_v,
               stride_bz_o, stride_seq_o, stride_h_o,
-              sm_scale);
+              sm_scale,
+              last_centroid_bias, lse_init.has_value()  // addition ClusterAttention
+            );
         });
       });
     });
   });
+
+  return lse;  // changed ClusterAttention
 }
 
-torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90(
+std::vector<torch::Tensor> qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold_sm90(
                     torch::Tensor query,
                     torch::Tensor key,
                     torch::Tensor value,
@@ -207,7 +242,8 @@ torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_wi
                     int is_causal,
                     int qk_quant_gran,
                     float sm_scale,
-                    int return_pv_count)
+                    int return_pv_count,
+                    int return_lse)  // addition ClusterAttention
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -316,6 +352,7 @@ torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_wi
   }
 
   torch::Tensor pv_count = torch::empty({0});
+  torch::Tensor lse = torch::empty({0});  // addition ClusterAttention
 
   auto output_dtype = output.scalar_type();
 
@@ -332,7 +369,12 @@ torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_wi
             {
               pv_count = torch::empty({batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / 16)}, query.options().dtype(at::ScalarType::Int));
             }
-
+            if (return_lse) {
+              lse = torch::full({batch_size, num_qo_heads, qo_len},
+                  -5000000.0f,
+                  query.options().dtype(at::ScalarType::Float));
+            }  // addition ClusterAttention
+              
             assert(padded_kv_len >= div_ceil(kv_len, CTA_K) * CTA_K);
 
             if constexpr (QK_QUANT_GRAN == 1)
@@ -363,8 +405,10 @@ torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_wi
                 reinterpret_cast<__nv_fp8_e4m3*>(value.data_ptr()),
                 reinterpret_cast<DTypeOut*>(output.data_ptr()),
                 (RETURN_PV_COUNT) ? reinterpret_cast<int32_t*>(pv_count.data_ptr()) : nullptr,
+                return_lse ? lse.data_ptr<float>() : nullptr,  // addition ClusterAttention
                 reinterpret_cast<int32_t*>(lut.data_ptr()),
                 reinterpret_cast<int32_t*>(valid_block_num.data_ptr()),
+                nullptr,  // addition ClusterAttention
                 reinterpret_cast<float*>(pv_threshold.data_ptr()),
                 reinterpret_cast<float*>(query_scale.data_ptr()),
                 reinterpret_cast<float*>(key_scale.data_ptr()),
@@ -374,12 +418,14 @@ torch::Tensor qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_wi
                 stride_bz_k, stride_seq_k, stride_h_k,
                 stride_bz_v, stride_h_v, stride_d_v,
                 stride_bz_o, stride_seq_o, stride_h_o,
-                sm_scale);
+                sm_scale,
+                0.0f, false  // addition ClusterAttention
+              );
           });
         });
       });
     });
   });
 
-  return pv_count;
+  return {pv_count, lse};  // changed ClusterAttention
 }

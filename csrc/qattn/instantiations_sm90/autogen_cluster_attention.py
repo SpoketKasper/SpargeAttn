@@ -7,13 +7,15 @@ CTA_K = 128
 NUM_THREADS = 128
 fuse_v_scale = True
 
-# Swept parameters
+# Only the combinations ClusterAttention actually dispatches:
+#   sage_with_custom_mask calls qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90
+#   with is_causal=False, qk_quant_gran=1, pv_threshold_mode=0, output bf16, no pv_count
 head_dims = [64, 128]
-qk_quant_grans = [1, 2, 3]
-pv_threshold_modes = [0, 1]
-dtypes_out = ["half", "nv_bfloat16"]
-is_causals = [True, False]
-return_pv_counts = [False, True]
+qk_quant_grans = [1]
+pv_threshold_modes = [0]
+dtypes_out = ["nv_bfloat16"]
+is_causals = [False]
+return_pv_counts = [False]
 
 # Output directory
 output_dir = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +28,9 @@ def bool_to_int(b):
 # Function parameter list
 param_list = (
     "  int8_t* Q, int8_t* K, __nv_fp8_e4m3* V, {dtype_out}* O,\n"
-    "  int32_t* PV_Count, float* Lse,\n"  # addition ClusterAttention
+    "  int32_t* PV_Count, float* Lse,\n"
     "  int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num,\n"
-    "  uint32_t* Bitmask,\n"  # addition ClusterAttention
+    "  uint32_t* Bitmask,\n"
     "  float *__restrict__ PV_Threshold,\n"
     "  float* Q_scale, float* K_scale, float* V_scale,\n"
     "  const uint32_t batch_size, const uint32_t qo_len, const uint32_t kv_len, const uint32_t padded_kv_len, const uint32_t num_qo_heads, const uint32_t num_kv_heads,\n"
@@ -65,4 +67,4 @@ for hd, qkg, pv_mode, dtype_out, causal, ret_pv_count in product(
         f.write(header)
         f.write(instantiation + "\n")
 
-print(f"Generated {len(os.listdir(output_dir))} instantiations in '{output_dir}'")
+print(f"Generated {len(os.listdir(output_dir)) - 1} instantiation(s) in '{output_dir}'")

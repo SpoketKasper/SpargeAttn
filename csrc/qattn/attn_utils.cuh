@@ -34,6 +34,7 @@
 enum class MaskMode {
   kNone = 0,
   kCausal = 1,
+  kBitmask = 2,  // addition ClusterAttention
 };
 
 enum class DataType {

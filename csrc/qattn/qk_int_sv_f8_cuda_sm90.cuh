@@ -178,7 +178,11 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
                                         const __grid_constant__ CUtensorMap tensorMapK,
                                         const __grid_constant__ CUtensorMap tensorMapV,
                                         float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale,
-                                        DTypeOut* O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
+                                        DTypeOut* O, int32_t *__restrict__ PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, 
+                                        uint32_t* Bitmask,  // addition ClusterAttention
+                                        float *__restrict__ PV_Threshold,
+                                        float *__restrict__ Lse,   // addition ClusterAttention
+                                        float last_centroid_bias, bool use_lse_init,  // addition ClusterAttention
                                         uint32_t stride_bz_o, uint32_t stride_h_o, uint32_t stride_seq_o,
                                         const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                                         float sm_scale)
@@ -203,6 +207,17 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
   sm_scale *= math::log2e;
 
+  // start addition ClusterAttention
+  uint32_t bitmask_base;
+  uint32_t n_words;
+  if constexpr (mask_mode == MaskMode::kBitmask)
+  {
+    n_words = div_ceil(kv_len, 32);
+    //const uint32_t n_words = div_ceil(kv_len, 32);
+    bitmask_base = batch_id*num_qo_heads*gridDim.x*n_words + head_id*gridDim.x*n_words + bx*n_words;
+  }
+  // end addition ClusterAttention
+
   float pv_threshold;
   int pv_count = 0;
 
@@ -217,6 +232,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
   int8_t *sK = (int8_t*)(smem_ + CTA_Q * head_dim * sizeof(int8_t));
   int8_t *sV = (int8_t*)(smem_ + CTA_Q * head_dim * sizeof(int8_t) + CTA_K * head_dim * sizeof(int8_t));
   half *sO = (half*)smem_;
+  uint32_t *smem_bitmask = (uint32_t*)(smem_ + CTA_Q * head_dim * sizeof(int8_t) + 2 * CTA_K * head_dim * sizeof(int8_t));  // addition ClusterAttention
 
   int32_t RS[num_tiles_q][num_tiles_k][8];
   float RO[num_tiles_q][num_tiles_v][8];
@@ -256,32 +272,35 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
   uint32_t Q_idx_lane_base = bx * CTA_Q + warp_idx * 16 + lane_id / 4;
 
-#pragma unroll
-  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-  {
-    m[fq][0] = -5000000.0f;
-    m[fq][1] = -5000000.0f;
-    d[fq][0] = 1.0f;
-    d[fq][1] = 1.0f;
-  }
+// removed ClusterAttention (to have optional init values)
+//#pragma unroll
+//  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+//  {
+//    m[fq][0] = -5000000.0f;
+//    m[fq][1] = -5000000.0f;
+//    d[fq][0] = 1.0f;
+//    d[fq][1] = 1.0f;
+//  }
 
-#pragma unroll
-  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-  {
-#pragma unroll
-    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
-    {
-#pragma unroll
-      for (uint32_t k = 0; k < 8; k++)
-      {
-        RO[fq][fv][k] = 0.0f;
-      }
-    }
-  }
+// removed ClusterAttention (to have optional init values)
+//#pragma unroll
+//  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+//  {
+//#pragma unroll
+//    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+//    {
+//#pragma unroll
+//      for (uint32_t k = 0; k < 8; k++)
+//      {
+//        RO[fq][fv][k] = 0.0f;
+//      }
+//    }
+//  }
 
   __shared__ __align__(8) uint64_t barrier_Q;
   __shared__ __align__(8) uint64_t barrier_K;
   __shared__ __align__(8) uint64_t barrier_V;
+  //__shared__ __align__(16) uint32_t smem_bitmask[CTA_K / 32];  // addition ClusterAttention (4*4=16 bytes)
 
   if (threadIdx.x == 0)
   {
@@ -316,12 +335,134 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     load_async_4D(sK, &tensorMapK, &barrier_K, 0, KV_block_idx * CTA_K, kv_head_id, batch_id);
     load_async_4D(sV, &tensorMapV, &barrier_V, KV_block_idx * CTA_K, 0, kv_head_id, batch_id);
   }
+  // start addition ClusterAttention (full bitmask preload for the query cluster)
+  if constexpr (mask_mode == MaskMode::kBitmask)
+  {
+    for (uint32_t w = threadIdx.x; w < n_words; w += NUM_THREADS)
+    {
+      uint32_t sa = static_cast<uint32_t>(__cvta_generic_to_shared(&smem_bitmask[w]));
+      uint64_t ga = reinterpret_cast<uint64_t>(Bitmask + bitmask_base + w);
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(sa), "l"(ga) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  }
+  // end addition ClusterAttention
+
+  // start addition ClusterAttention (want the init loads after the QKV load issue, and after early return)
+  if (use_lse_init)
+  {
+    const float d_init = exp2f(S_FP8_OFFSET) * 0.25f;  // normalize_d sums d over the 4 lanes sharing this row
+    const float *Lse_row = Lse + batch_id * num_qo_heads * qo_len + head_id * qo_len;
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+    {
+      const uint32_t row0 = Q_idx_lane_base + fq * 64;
+      m[fq][0] = (row0     < qo_len) ? Lse_row[row0]     : -5000000.0f;
+      m[fq][1] = (row0 + 8 < qo_len) ? Lse_row[row0 + 8] : -5000000.0f;
+      d[fq][0] = (row0     < qo_len) ? d_init : 1.0f;
+      d[fq][1] = (row0 + 8 < qo_len) ? d_init : 1.0f;
+    }
+
+    const float ro_scale = exp2f(S_FP8_OFFSET);
+    const DTypeOut *O_init = O + batch_id * stride_bz_o + head_id * stride_h_o
+                               + (bx * CTA_Q + warp_idx * 16 + lane_id / 4) * stride_seq_o
+                               + (lane_id % 4) * 2;
+    const float *V_scale_init = V_scale + batch_id * (num_qo_heads / num_kv_groups) * head_dim
+                              + (head_id / num_kv_groups) * head_dim + (lane_id % 4) * 2;
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      float s[4] = {ro_scale, ro_scale, ro_scale, ro_scale};
+      if constexpr (fuse_v_scale)
+      {
+        float vs[4];
+        ((float2*)vs)[0] = *((float2*)(V_scale_init + fv * 16));
+        ((float2*)vs)[1] = *((float2*)(V_scale_init + fv * 16 + 8));
+        s[0] = ro_scale / vs[0];  s[1] = ro_scale / vs[1];
+        s[2] = ro_scale / vs[2];  s[3] = ro_scale / vs[3];
+      }
+
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        const DTypeOut *p = O_init + fq * 64 * stride_seq_o + fv * 16;
+        const bool ok0 = (Q_idx_lane_base + fq * 64     < qo_len);
+        const bool ok1 = (Q_idx_lane_base + fq * 64 + 8 < qo_len);
+
+        float2 a = make_float2(0.f, 0.f), b = a, c = a, e = a;
+        if (ok0)
+        {
+          if constexpr (std::is_same<DTypeOut, half>::value)
+          {
+            a = __half22float2(*(const half2*)p);
+            b = __half22float2(*(const half2*)(p + 8));
+          }
+          else
+          {
+            a = __bfloat1622float2(*(const nv_bfloat162*)p);
+            b = __bfloat1622float2(*(const nv_bfloat162*)(p + 8));
+          }
+        }
+        if (ok1)
+        {
+          if constexpr (std::is_same<DTypeOut, half>::value)
+          {
+            c = __half22float2(*(const half2*)(p + 8 * stride_seq_o));
+            e = __half22float2(*(const half2*)(p + 8 * stride_seq_o + 8));
+          }
+          else
+          {
+            c = __bfloat1622float2(*(const nv_bfloat162*)(p + 8 * stride_seq_o));
+            e = __bfloat1622float2(*(const nv_bfloat162*)(p + 8 * stride_seq_o + 8));
+          }
+        }
+
+        RO[fq][fv][0] = a.x * s[0];  RO[fq][fv][1] = a.y * s[1];
+        RO[fq][fv][2] = c.x * s[0];  RO[fq][fv][3] = c.y * s[1];
+        RO[fq][fv][4] = b.x * s[2];  RO[fq][fv][5] = b.y * s[3];
+        RO[fq][fv][6] = e.x * s[2];  RO[fq][fv][7] = e.y * s[3];
+      }
+    }
+  }
+  else  // earlier code but moved
+  {
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+    m[fq][0] = -5000000.0f;
+    m[fq][1] = -5000000.0f;
+    d[fq][0] = 1.0f;
+    d[fq][1] = 1.0f;
+  }
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++)
+      {
+        RO[fq][fv][k] = 0.0f;
+      }
+    }
+  }
+  }
+  // end addition ClusterAttention
 
   float q_scale = Q_scale[q_scale_idx];
   float original_sm_scale = sm_scale;
 
   // wait for Q
   wait(&barrier_Q, 0);
+
+  // start addition ClusterAttention
+  if constexpr (mask_mode == MaskMode::kBitmask)
+  {
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();
+  }
+  // end addition ClusterAttention
 
   int p = 1;
   for (uint32_t iter = 1; iter < num_iterations; iter++)
@@ -330,6 +471,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
     float dequant_scale = q_scale * K_scale[k_scale_idx + KV_block_idx * k_scale_advance_offset];
     sm_scale = original_sm_scale * dequant_scale;
+    uint32_t KV_block_idx_prev = KV_block_idx;  // addition ClusterAttention
     KV_block_idx += Lut[iter];
 
     // wait for K
@@ -373,6 +515,29 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
         }
       }
     }
+
+    // start addition ClusterAttention
+    if constexpr (mask_mode == MaskMode::kBitmask)
+    {
+      const uint32_t bm_base = (KV_block_idx_prev * CTA_K) / 32;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+      {
+        const uint32_t word = smem_bitmask[bm_base + fk / 2];
+#pragma unroll
+        for (uint32_t k = 0; k < 8; k++)
+        {
+          const uint32_t centroid_idx = fk * 16 + 2 * (lane_id % 4) + 8 * (k / 4) + k % 2;
+          if ((word >> (centroid_idx % 32)) & 1)
+          {
+#pragma unroll
+            for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+              RS_f32[fq][fk][k] = -5000000.0f;
+          }
+        }
+      }
+    }
+    // end addition ClusterAttention
 
     if constexpr (pv_threashold_mode != PVThresholdMode::kNone)
     {
@@ -640,6 +805,19 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
           {
             is_out_of_bounds = (k_idx > q_idx) || (k_idx >= kv_len);
           }
+          // start addition ClusterAttention
+          else if constexpr (mask_mode == MaskMode::kBitmask)
+          {
+            const uint32_t centroid_idx = fk * 16 + 2 * (lane_id % 4) + 8 * (k / 4) + k % 2;
+            const uint32_t word = smem_bitmask[(KV_block_idx * CTA_K) / 32 + fk / 2];
+            is_out_of_bounds = ((word >> (centroid_idx % 32)) & 1) || (k_idx >= kv_len);
+
+            if (k_idx == kv_len - 1)
+            {
+              RS_f32[fq][fk][k] += last_centroid_bias;  // bias for the size of the last cluster
+            }
+          }
+          // end addition ClusterAttention
           else
           {
             is_out_of_bounds = (k_idx >= kv_len);
@@ -717,6 +895,27 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 
   normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore>(RO, m, d);
 
+  // addition ClusterAttention (export of LSE) ---
+  if (Lse != nullptr)
+  {
+    #pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+    {
+      uint32_t row0 = bx * CTA_Q + warp_idx * 16 + lane_id / 4 + fq * 64;
+      uint32_t row1 = row0 + 8;
+      if (lane_id % 4 == 0)
+      {
+        if (row0 < qo_len)
+          Lse[batch_id * num_qo_heads * qo_len + head_id * qo_len + row0] =
+            m[fq][0] - S_FP8_OFFSET + log2f(d[fq][0]);
+        if (row1 < qo_len)
+          Lse[batch_id * num_qo_heads * qo_len + head_id * qo_len + row1] =
+            m[fq][1] - S_FP8_OFFSET + log2f(d[fq][1]);
+      }
+    }
+  }
+  // end addition ClusterAttention
+
   if constexpr (fuse_v_scale)
   {
     float v_scale[4];
@@ -783,40 +982,58 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
 template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t NUM_THREADS, uint32_t head_dim, uint32_t qk_quant_gran, uint32_t pv_threashold_mode, typename DTypeOut, bool is_causal, bool fuse_v_scale, bool return_pv_count>
 void SpargeAttentionSM90Dispatched(
   int8_t* Q, int8_t* K, __nv_fp8_e4m3* V, DTypeOut* O,
-  int32_t* PV_Count, int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, float *__restrict__ PV_Threshold,
+  int32_t* PV_Count, float* Lse,  // addition ClusterAttention
+  int32_t *__restrict__ Lut, int32_t *__restrict__ Valid_Block_Num, 
+  uint32_t* Bitmask,  // addition ClusterAttention
+  float *__restrict__ PV_Threshold,
   float* Q_scale, float* K_scale, float* V_scale,
   const uint32_t batch_size, const uint32_t qo_len, const uint32_t kv_len, const uint32_t padded_kv_len, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
   const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
   const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
   const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
   const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
-  float sm_scale)
+  float sm_scale,
+  float last_centroid_bias, bool use_lse_init  // addition ClusterAttention (could do without, but lets us skip allocations)
+)
 {
-  constexpr MaskMode mask_mode = is_causal ? MaskMode::kCausal : MaskMode::kNone;
+  // removed for ClusterAttention: constexpr MaskMode mask_mode = is_causal ? MaskMode::kCausal : MaskMode::kNone; 
 
   CUtensorMap tma_map_Q = create_tensor_map_4D<CTA_Q, head_dim>(Q, batch_size, num_qo_heads, qo_len, head_dim, stride_bz_q, stride_h_q, stride_seq_q);
   CUtensorMap tma_map_K = create_tensor_map_4D<CTA_K, head_dim>(K, batch_size, num_kv_heads, kv_len, head_dim, stride_bz_k, stride_h_k, stride_seq_k);
   CUtensorMap tma_map_V = create_tensor_map_4D<head_dim, CTA_K>(V, batch_size, num_kv_heads, head_dim, padded_kv_len, stride_bz_v, stride_h_v, stride_d_v);
 
-  auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, head_dim, static_cast<QuantGranularity>(qk_quant_gran), static_cast<QuantGranularity>(qk_quant_gran), static_cast<PVThresholdMode>(pv_threashold_mode), DTypeOut, mask_mode, fuse_v_scale, return_pv_count>;
+  // removed for ClusterAttention: auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, head_dim, static_cast<QuantGranularity>(qk_quant_gran), static_cast<QuantGranularity>(qk_quant_gran), static_cast<PVThresholdMode>(pv_threashold_mode), DTypeOut, mask_mode, fuse_v_scale, return_pv_count>;
   size_t sMemSize = CTA_Q * head_dim * sizeof(int8_t) + CTA_K * head_dim * sizeof(int8_t) + CTA_K * head_dim * sizeof(int8_t);
-  cudaFuncSetAttribute(
-      kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+  // removed for ClusterAttention: 
+  //cudaFuncSetAttribute(
+  //    kernel,
+  //    cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
   
+  // change ClusterAttention: branch on new param Bitmask. else-branch is how it was before change.
   dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
-  kernel<<<grid, NUM_THREADS, sMemSize>>>(
-    tma_map_Q,
-    tma_map_K,
-    tma_map_V,
-    Q_scale,
-    K_scale,
-    V_scale,
-    O,
-    PV_Count,
-    Lut,
-    Valid_Block_Num,
-    PV_Threshold,
-    stride_bz_o, stride_h_o, stride_seq_o,
-    qo_len, kv_len, num_qo_heads / num_kv_heads, sm_scale);
+  if (Bitmask) {
+    // disabling return_pv_count to avoid compilation with both this and bitmask, which does not compile due to register limits.
+    sMemSize += div_ceil(kv_len, CTA_K) * (CTA_K / 32) * sizeof(uint32_t);
+    auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, head_dim, static_cast<QuantGranularity>(qk_quant_gran), static_cast<QuantGranularity>(qk_quant_gran), PVThresholdMode::kNone, DTypeOut, MaskMode::kBitmask, fuse_v_scale, false>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+    kernel<<<grid, NUM_THREADS, sMemSize>>>(
+      tma_map_Q, tma_map_K, tma_map_V,
+      Q_scale, K_scale, V_scale, O, PV_Count, Lut, Valid_Block_Num, Bitmask, PV_Threshold, Lse,
+      last_centroid_bias, use_lse_init,
+      stride_bz_o, stride_h_o, stride_seq_o,
+      qo_len, kv_len, num_qo_heads / num_kv_heads, sm_scale);
+  } else {
+    constexpr MaskMode mask_mode = is_causal ? MaskMode::kCausal : MaskMode::kNone;
+    auto* kernel = qk_int8_sv_f8_attn_kernel<CTA_Q, CTA_K, NUM_THREADS, head_dim, static_cast<QuantGranularity>(qk_quant_gran), static_cast<QuantGranularity>(qk_quant_gran), static_cast<PVThresholdMode>(pv_threashold_mode), DTypeOut, mask_mode, fuse_v_scale, return_pv_count>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize);
+    kernel<<<grid, NUM_THREADS, sMemSize>>>(
+      tma_map_Q, tma_map_K, tma_map_V,
+      Q_scale, K_scale, V_scale, O, PV_Count, Lut, Valid_Block_Num, 
+      nullptr,  // addition ClusterAttention
+      PV_Threshold, 
+      Lse,  // addition ClusterAttention
+      last_centroid_bias, use_lse_init,  // addition ClusterAttention
+      stride_bz_o, stride_h_o, stride_seq_o,
+      qo_len, kv_len, num_qo_heads / num_kv_heads, sm_scale);
+  }
 }

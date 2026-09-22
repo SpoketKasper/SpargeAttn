@@ -86,7 +86,8 @@ def block_map_lut_triton(block_map):
 
     return lut, valid_block_num
 
-@triton.jit
+#@triton.jit
+@triton.jit(do_not_specialize=["N"])
 def qk_quantize(
     # Pointers
     x_ptr,
@@ -94,7 +95,7 @@ def qk_quantize(
     x_quant_ptr,
     scale_ptr,
     # Constexpr dimensions
-    N: tl.constexpr,
+    N, # : tl.constexpr,  # removed constexpr and added do_not_specialize ClusterAttention
     D: tl.constexpr,
     BS: tl.constexpr,
     fuse_mean: tl.constexpr
